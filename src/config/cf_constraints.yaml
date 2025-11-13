@@ -1,0 +1,25 @@
+immutable_features:
+- age
+- sex
+sensitive_features: []
+actionable_features:
+- job
+- credit_amount
+- duration
+- housing
+- saving_accounts
+- checking_account
+- purpose
+continuous_features:
+- age
+- job
+- credit_amount
+- duration
+categorical_features:
+- sex
+- housing
+- saving_accounts
+- checking_account
+- purpose
+feature_ranges: {}
+notes: Edit immutable/actionable lists and feature_ranges to reflect domain constraints.

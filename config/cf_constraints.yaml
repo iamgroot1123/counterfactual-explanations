@@ -1,0 +1,20 @@
+immutable_features:
+  - age
+  - sex
+
+sensitive_features:
+  - sex
+
+actionable_features:
+  - credit_amount
+  - duration
+  - housing
+  - saving_accounts
+  - checking_account
+  - job
+  - purpose
+
+feature_ranges:
+  credit_amount: [250, 20000]
+  duration: [4, 72]
+  
