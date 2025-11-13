@@ -119,6 +119,32 @@ def human_change_string(orig_row, cf_row, prefix_map):
                 actions.append(f"{orig}: {orig_choice} → {cf_choice}")
     return changes, "; ".join(actions)
 
+def compute_simple_cost(orig, cf, prefix_map):
+    num_cost = 0.0; cat_cost = 0
+    for pref, cols in prefix_map.items():
+        if len(cols) == 1:
+            c = cols[0]
+            try:
+                denom = max(abs(float(orig.get(c,0))), 1.0)
+                num_cost += abs(float(cf.get(c, orig.get(c,0))) - float(orig.get(c,0))) / denom
+            except Exception:
+                pass
+        else:
+            oc = decode_choice(orig, cols)
+            cc = decode_choice(cf, cols)
+            if oc != cc:
+                cat_cost += 1
+    return num_cost + 0.7*cat_cost
+
+def set_col_val_float(template, col, val):
+    if col in template.columns:
+        try:
+            template.at[0, col] = float(val)
+        except Exception:
+            # fallback: set 0.0 if conversion fails
+            template.at[0, col] = 0.0
+    return template
+
 # ---- UI: Title and short explanation ----
 st.set_page_config(page_title="Counterfactuals Demo — Truth Decoders", layout="wide")
 st.title("Counterfactuals Demo — Truth Decoders")
@@ -126,6 +152,12 @@ st.markdown(
     "Counterfactual explanations show minimal changes that would flip a model's decision.\n"
     "Enter applicant details below. If the model denies the application, the app will suggest actionable changes."
 )
+
+# Initialize session state for realism threshold and CFs
+if 'realism' not in st.session_state:
+    st.session_state['realism'] = 1.0
+if 'readable' not in st.session_state:
+    st.session_state['readable'] = []
 
 # ---- Load model & metadata ----
 pipeline, feature_columns, target_col = load_model_and_metadata()
@@ -162,257 +194,243 @@ purpose = st.sidebar.selectbox("Purpose", options=[
     "radio/TV","furniture/equipment","car","education","business","domestic appliances","repairs","vacation/others"
 ], index=2)
 
-if st.sidebar.button("Predict & Suggest CFs"):
-    # Build a one-row DataFrame aligned with pipeline expected features (encoded)
-    # Strategy: create a DataFrame using train_df's columns if available, else try best-effort mapping
-    if train_df is None:
-        st.error("Cannot generate CFs because processed training data is missing. Run preprocess.py.")
+# Build a one-row DataFrame aligned with pipeline expected features (encoded)
+# Strategy: create a DataFrame using train_df's columns if available, else try best-effort mapping
+if train_df is None:
+    st.error("Cannot generate CFs because processed training data is missing. Run preprocess.py.")
+else:
+    # ---------- BEGIN PATCH: robust numeric template creation & debug prints ----------
+    # construct a numeric template row with zeros (ensure numeric dtype)
+    template = pd.DataFrame([ [0.0]*len(feature_columns) ], columns=feature_columns, dtype=float)
+
+    # set numeric/simple
+    template = set_col_val_float(template, "age", age)
+    template = set_col_val_float(template, "job", job)
+    template = set_col_val_float(template, "credit_amount", credit_amount)
+    template = set_col_val_float(template, "duration", duration)
+
+    # set one-hot encoded categories as floats (1.0)
+    if f"sex_{sex}" in template.columns:
+        template.at[0, f"sex_{sex}"] = 1.0
     else:
-        # ---------- BEGIN PATCH: robust numeric template creation & debug prints ----------
-        # construct a numeric template row with zeros (ensure numeric dtype)
-        template = pd.DataFrame([ [0.0]*len(feature_columns) ], columns=feature_columns, dtype=float)
+        # fallback if sex is single column
+        if "sex" in template.columns:
+            # try numeric mapping
+            template.at[0, "sex"] = 1.0 if str(sex).lower() in ("male","m","1","true") else 0.0
 
-        # helper to set numeric column if exists
-        def set_col_val_float(col, val):
-            if col in template.columns:
-                try:
-                    template.at[0, col] = float(val)
-                except Exception:
-                    # fallback: set 0.0 if conversion fails
-                    template.at[0, col] = 0.0
+    if f"housing_{housing}" in template.columns:
+        template.at[0, f"housing_{housing}"] = 1.0
 
-        # set numeric/simple
-        set_col_val_float("age", age)
-        set_col_val_float("job", job)
-        set_col_val_float("credit_amount", credit_amount)
-        set_col_val_float("duration", duration)
+    sk = saving_accounts
+    if f"saving_accounts_{sk}" in template.columns:
+        template.at[0, f"saving_accounts_{sk}"] = 1.0
 
-        # set one-hot encoded categories as floats (1.0)
-        if f"sex_{sex}" in template.columns:
-            template.at[0, f"sex_{sex}"] = 1.0
-        else:
-            # fallback if sex is single column
-            if "sex" in template.columns:
-                # try numeric mapping
-                template.at[0, "sex"] = 1.0 if str(sex).lower() in ("male","m","1","true") else 0.0
+    ck = checking_account
+    if f"checking_account_{ck}" in template.columns:
+        template.at[0, f"checking_account_{ck}"] = 1.0
 
-        if f"housing_{housing}" in template.columns:
-            template.at[0, f"housing_{housing}"] = 1.0
+    pk = purpose
+    if f"purpose_{pk}" in template.columns:
+        template.at[0, f"purpose_{pk}"] = 1.0
 
-        sk = saving_accounts
-        if f"saving_accounts_{sk}" in template.columns:
-            template.at[0, f"saving_accounts_{sk}"] = 1.0
+    # Fill missing numeric columns (non-one-hot) with train median if available
+    for c in template.columns:
+        # don't overwrite explicitly set one-hot columns with medians (they are floats already but may be 0.0)
+        if "_" in c:
+            # keep as-is (one-hot)
+            continue
+        if template.at[0, c] == 0.0 and c in train_df.columns and pd.api.types.is_numeric_dtype(train_df[c]):
+            template.at[0, c] = float(train_df[c].median())
 
-        ck = checking_account
-        if f"checking_account_{ck}" in template.columns:
-            template.at[0, f"checking_account_{ck}"] = 1.0
+    # Defensive cleanup: force numeric dtype for all columns; convert boolean-like or text to numeric 0/1
+    for c in template.columns:
+        if not pd.api.types.is_numeric_dtype(template[c]):
+            try:
+                template[c] = template[c].astype(float)
+            except Exception:
+                # fallback common string->bool mapping
+                template[c] = template[c].apply(lambda x: 1.0 if str(x).lower() in ("true","1","yes") else 0.0)
+    # final coercion
+    template = template.astype(float)
 
-        pk = purpose
-        if f"purpose_{pk}" in template.columns:
-            template.at[0, f"purpose_{pk}"] = 1.0
+    # DEBUG: show dtypes and sample values in UI so we can confirm everything is numeric
+    st.write("Template dtypes (should be numeric):")
+    st.json({k: str(v) for k,v in template.dtypes.to_dict().items()})
+    st.write("Template sample row (first 10 cols):")
+    st.write(template.iloc[0].to_dict())
 
-        # Fill missing numeric columns (non-one-hot) with train median if available
-        for c in template.columns:
-            # don't overwrite explicitly set one-hot columns with medians (they are floats already but may be 0.0)
-            if "_" in c:
-                # keep as-is (one-hot)
-                continue
-            if template.at[0, c] == 0.0 and c in train_df.columns and pd.api.types.is_numeric_dtype(train_df[c]):
-                template.at[0, c] = float(train_df[c].median())
+    # Now safe to call model predict
+    try:
+        pred = pipeline.predict(template)[0]
+        pred_proba = pipeline.predict_proba(template)[0][1] if hasattr(pipeline, "predict_proba") else None
+    except Exception as e:
+        st.error(f"Prediction failed (template types): {e}")
+        st.stop()
+    # ---------- END PATCH ----------
 
-        # Defensive cleanup: force numeric dtype for all columns; convert boolean-like or text to numeric 0/1
-        for c in template.columns:
-            if not pd.api.types.is_numeric_dtype(template[c]):
-                try:
-                    template[c] = template[c].astype(float)
-                except Exception:
-                    # fallback common string->bool mapping
-                    template[c] = template[c].apply(lambda x: 1.0 if str(x).lower() in ("true","1","yes") else 0.0)
-        # final coercion
-        template = template.astype(float)
+    st.markdown("### Model result")
+    if pred == 1:
+        st.success("Model predicted: **APPROVE** (good risk)")
+        if pred_proba is not None:
+            st.write(f"Approval probability: {pred_proba:.3f}")
+    else:
+        st.error("Model predicted: **DENY** (bad risk)")
+        if pred_proba is not None:
+            st.write(f"Approval probability: {pred_proba:.3f}")
 
-        # DEBUG: show dtypes and sample values in UI so we can confirm everything is numeric
-        st.write("Template dtypes (should be numeric):")
-        st.json({k: str(v) for k,v in template.dtypes.to_dict().items()})
-        st.write("Template sample row (first 10 cols):")
-        st.write(template.iloc[0].to_dict())
+        # Generate CFs with DiCE for this single instance
+        with st.spinner("Generating counterfactual explanations (DiCE)..."):
+            try:
+                continuous = feature_columns.copy()
+                d = dice_ml.Data(
+                    dataframe=train_df[[*feature_columns, target_col]],
+                    continuous_features=continuous,
+                    outcome_name=target_col,
+                )
+                m = dice_ml.Model(model=pipeline, backend="sklearn", model_type="classifier")
+                exp = Dice(d, m, method="genetic")
 
-        # Now safe to call model predict
-        try:
-            pred = pipeline.predict(template)[0]
-            pred_proba = pipeline.predict_proba(template)[0][1] if hasattr(pipeline, "predict_proba") else None
-        except Exception as e:
-            st.error(f"Prediction failed (template types): {e}")
-            st.stop()
-        # ---------- END PATCH ----------
+                # build constraints from cfg (lock immutables)
+                permitted_range = {}
+                permitted_list = {}
+                immut = cfg.get("immutable_features", [])
+                immut_expanded = expand_to_encoded(immut, feature_columns)
 
-        st.markdown("### Model result")
-        if pred == 1:
-            st.success("Model predicted: **APPROVE** (good risk)")
-            if pred_proba is not None:
-                st.write(f"Approval probability: {pred_proba:.3f}")
-        else:
-            st.error("Model predicted: **DENY** (bad risk)")
-            if pred_proba is not None:
-                st.write(f"Approval probability: {pred_proba:.3f}")
+                # lock immutables to original values
+                for col in immut_expanded:
+                    if col in template.columns:
+                        val = template.at[0, col]
 
-            # Generate CFs with DiCE for this single instance
-            with st.spinner("Generating counterfactual explanations (DiCE)..."):
-                try:
-                    # prepare dice data/mode
-                    # Continuous features: we just pass all encoded feature_cols to DiCE
-                    continuous = feature_columns.copy()
-                    d = dice_ml.Data(dataframe=train_df[[*feature_columns, target_col]], continuous_features=continuous, outcome_name=target_col)
-                    m = dice_ml.Model(model=pipeline, backend="sklearn", model_type="classifier")
-                    exp = Dice(d, m, method="genetic")
-
-                    # build constraints from cfg (lock immutables)
-                    permitted_range = {}
-                    permitted_list = {}
-                    immut = cfg.get("immutable_features", [])
-                    immut_expanded = expand_to_encoded(immut, feature_columns)
-                    # lock immutables to original values
-                    for col in immut_expanded:
-                        if col in template.columns:
-                            val = template.at[0, col]
-                            # if binary one-hot
-                            if str(val) in ("0","1") or isinstance(val, (int, np.integer)):
-                                permitted_list[col] = [int(val)]
+                        # binary / integer one-hot case
+                        if str(val) in ("0", "1") or isinstance(val, (int, np.integer)):
+                            permitted_list[col] = [int(val)]
+                        else:
+                            # try to interpret as float; otherwise keep as string
+                            try:
+                                fv = float(val)
+                            except Exception:
+                                permitted_list[col] = [str(val)]
                             else:
+                                permitted_range[col] = [fv, fv]
+
+                # add feature_ranges from cfg
+                if "feature_ranges" in cfg and isinstance(cfg["feature_ranges"], dict):
+                    for feat, rng in cfg["feature_ranges"].items():
+                        enc_cols = expand_to_encoded([feat], feature_columns)
+                        for col in enc_cols:
+                            if col not in permitted_range and col not in permitted_list:
                                 try:
-                                    fv = float(val)
-                                    permitted_range[col] = [fv, fv]
-                                except Exception:
-                                    permitted_list[col] = [str(val)]
-
-                    # add feature_ranges from cfg
-                    if "feature_ranges" in cfg and isinstance(cfg["feature_ranges"], dict):
-                        for feat, rng in cfg["feature_ranges"].items():
-                            enc_cols = expand_to_encoded([feat], feature_columns)
-                            for col in enc_cols:
-                                if col not in permitted_range and col not in permitted_list:
-                                    try:
-                                        permitted_range[col] = [float(rng[0]), float(rng[1])]
-                                    except Exception:
-                                        pass
-
-                    # Ensure the template is numeric (float) and has no Python bools/strings
-                    template = template.astype(float)
-
-                    # call DiCE
-                    res = None
-                    try:
-                        res = exp.generate_counterfactuals(template, total_CFs=5, desired_class="opposite",
-                                                           permitted_range=permitted_range if permitted_range else None,
-                                                           permitted_list=permitted_list if permitted_list else None)
-                    except TypeError:
-                        # DiCE API mismatch: fallback to unconstrained generation and apply post-filtering
-                        res = exp.generate_counterfactuals(template, total_CFs=5, desired_class="opposite")
-
-                    # parse DiCE result
-                    cf_dfs = []
-                    try:
-                        for ex in res.cf_examples_list:
-                            if hasattr(ex, "final_cfs_df"):
-                                cf_dfs.append(ex.final_cfs_df)
-                            elif isinstance(ex, dict) and "final_cfs_df" in ex:
-                                cf_dfs.append(ex["final_cfs_df"])
-                        if not cf_dfs and hasattr(res, "final_cfs_df"):
-                            cf_dfs = [res.final_cfs_df]
-                    except Exception:
-                        st.warning("Could not parse DiCE output structure; no CFs shown.")
-                        cf_dfs = []
-
-                    # convert CFs to readable actions
-                    readable = []
-                    X_test_one = template.reset_index(drop=True)  # for original values
-                    orig_row = X_test_one.loc[0].to_dict()
-                    # optionally compute simple cost: numeric percent + categorical count
-                    def compute_simple_cost(orig, cf, prefix_map):
-                        num_cost = 0.0; cat_cost = 0
-                        for pref, cols in prefix_map.items():
-                            if len(cols) == 1:
-                                c = cols[0]
-                                try:
-                                    denom = max(abs(float(orig.get(c,0))), 1.0)
-                                    num_cost += abs(float(cf.get(c, orig.get(c,0))) - float(orig.get(c,0))) / denom
+                                    permitted_range[col] = [float(rng[0]), float(rng[1])]
                                 except Exception:
                                     pass
-                            else:
-                                oc = decode_choice(orig, cols)
-                                cc = decode_choice(cf, cols)
-                                if oc != cc:
-                                    cat_cost += 1
-                        return num_cost + 0.7*cat_cost
 
-                    # collect CFs
-                    for df_i, cf_df in enumerate(cf_dfs):
-                        for r_idx, row in cf_df.iterrows():
-                            # row may contain many columns; map to feature_columns
-                            cf_row = {c: row.get(c, orig_row.get(c, 0)) for c in feature_columns}
-                            # salvage lowercased names
-                            for k,v in list(row.items()):
-                                kl = k.lower()
-                                for c in feature_columns:
-                                    if kl == c.lower() and pd.isna(cf_row.get(c)):
-                                        cf_row[c] = v
-                            # post-filter one-hot integrity
-                            ok = True
-                            for pref, cols in prefix_map.items():
-                                if len(cols) <= 1:
-                                    continue
-                                s = 0
-                                for c in cols:
-                                    try:
-                                        s += float(cf_row.get(c, 0))
-                                    except Exception:
-                                        pass
-                                if not (abs(s - 1.0) < 1e-6):
-                                    ok = False; break
-                            if not ok:
+                # Ensure the template is numeric (float) and has no Python bools/strings
+                template = template.astype(float)
+
+                # call DiCE
+                res = None
+                try:
+                    res = exp.generate_counterfactuals(template, total_CFs=5, desired_class="opposite",
+                                                       permitted_range=permitted_range if permitted_range else None,
+                                                       permitted_list=permitted_list if permitted_list else None)
+                except TypeError:
+                    # DiCE API mismatch: fallback to unconstrained generation and apply post-filtering
+                    res = exp.generate_counterfactuals(template, total_CFs=5, desired_class="opposite")
+
+                # parse DiCE result
+                cf_dfs = []
+                try:
+                    for ex in res.cf_examples_list:
+                        if hasattr(ex, "final_cfs_df"):
+                            cf_dfs.append(ex.final_cfs_df)
+                        elif isinstance(ex, dict) and "final_cfs_df" in ex:
+                            cf_dfs.append(ex["final_cfs_df"])
+                    if not cf_dfs and hasattr(res, "final_cfs_df"):
+                        cf_dfs = [res.final_cfs_df]
+                except Exception:
+                    st.warning("Could not parse DiCE output structure; no CFs shown.")
+                    cf_dfs = []
+
+                # convert CFs to readable actions
+                readable = []
+                X_test_one = template.reset_index(drop=True)  # for original values
+                orig_row = X_test_one.loc[0].to_dict()
+                # optionally compute simple cost: numeric percent + categorical count
+
+                # collect CFs
+                for df_i, cf_df in enumerate(cf_dfs):
+                    for r_idx, row in cf_df.iterrows():
+                        # row may contain many columns; map to feature_columns
+                        cf_row = {c: row.get(c, orig_row.get(c, 0)) for c in feature_columns}
+                        # salvage lowercased names
+                        for k,v in list(row.items()):
+                            kl = k.lower()
+                            for c in feature_columns:
+                                if kl == c.lower() and pd.isna(cf_row.get(c)):
+                                    cf_row[c] = v
+                        # post-filter one-hot integrity
+                        ok = True
+                        for pref, cols in prefix_map.items():
+                            if len(cols) <= 1:
                                 continue
-                            # human-change string
-                            changed, action_str = human_change_string(orig_row, cf_row, prefix_map)
-                            cost = compute_simple_cost(orig_row, cf_row, prefix_map)
-                            # minimality ranking metric (prefer fewer human changes then lower cost)
-                            readable.append({
-                                "cf_id": f"u_cf_{df_i}_{r_idx}",
-                                "changed": changed,
-                                "action": action_str,
-                                "cost": cost,
-                                "n_changed": len(changed),
-                                "cf_row": cf_row
-                            })
-                    if not readable:
-                        st.warning("No valid counterfactuals found (after integrity checks).")
+                            s = 0
+                            for c in cols:
+                                try:
+                                    s += float(cf_row.get(c, 0))
+                                except Exception:
+                                    pass
+                            if not (abs(s - 1.0) < 1e-6):
+                                ok = False; break
+                        if not ok:
+                            continue
+                        # human-change string
+                        changed, action_str = human_change_string(orig_row, cf_row, prefix_map)
+                        cost = compute_simple_cost(orig_row, cf_row, prefix_map)
+                        # minimality ranking metric (prefer fewer human changes then lower cost)
+                        readable.append({
+                            "cf_id": f"u_cf_{df_i}_{r_idx}",
+                            "changed": changed,
+                            "action": action_str,
+                            "cost": cost,
+                            "n_changed": len(changed),
+                            "cf_row": cf_row
+                        })
+                if not readable:
+                    st.warning("No valid counterfactuals found (after integrity checks).")
+                else:
+                    # Store readable CFs in session state
+                    st.session_state['readable'] = readable
+                    # allow user to pick realism threshold to filter
+                    st.subheader("Suggested minimal changes")
+                    realism = st.slider("Realism threshold (max cost)", min_value=0.0, max_value=5.0, value=st.session_state['realism'], step=0.1, key='realism_slider')
+                    st.session_state['realism'] = realism
+                    # filter and sort
+                    filtered = [r for r in st.session_state['readable'] if r["cost"] <= realism]
+                    if not filtered:
+                        st.info("No CFs meet the realism threshold. Lower the threshold or try different inputs.")
                     else:
-                        # allow user to pick realism threshold to filter
-                        st.subheader("Suggested minimal changes")
-                        realism = st.slider("Realism threshold (max cost)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
-                        # filter and sort
-                        filtered = [r for r in readable if r["cost"] <= realism]
-                        if not filtered:
-                            st.info("No CFs meet the realism threshold. Lower the threshold or try different inputs.")
-                        else:
-                            # sort by n_changed then cost
-                            filtered = sorted(filtered, key=lambda x: (x["n_changed"], x["cost"]))
-                            # show top 3 readable bullets
-                            for i, rec in enumerate(filtered[:3]):
-                                st.markdown(f"**Option {i+1}** — {rec['n_changed']} change(s), score={rec['cost']:.3f}")
-                                st.write(rec["action"])
-                                if st.button(f"Apply Option {i+1} and re-run prediction", key=f"apply_{i}"):
-                                    # apply cf_row to template and re-run model
-                                    new_row = pd.Series(rec["cf_row"])
-                                    try:
-                                        new_pred = pipeline.predict(new_row.to_frame().T)[0]
-                                    except Exception as e:
-                                        st.error(f"Re-prediction failed: {e}")
-                                        new_pred = None
-                                    if new_pred == 1:
-                                        st.success("After applying changes: model predicts APPROVE ✅")
-                                    elif new_pred == 0:
-                                        st.error("After applying changes: model still predicts DENY ❌")
-                                    else:
-                                        st.write("Prediction result:", new_pred)
-                except Exception as e:
-                    st.error(f"Counterfactual generation failed: {e}")
+                        # sort by n_changed then cost
+                        filtered = sorted(filtered, key=lambda x: (x["n_changed"], x["cost"]))
+                        # show top 3 readable bullets
+                        for i, rec in enumerate(filtered[:3]):
+                            st.markdown(f"**Option {i+1}** — {rec['n_changed']} change(s), score={rec['cost']:.3f}")
+                            st.write(rec["action"])
+                            if st.button(f"Apply Option {i+1} and re-run prediction", key=f"apply_{i}"):
+                                # apply cf_row to template and re-run model
+                                new_row = pd.Series(rec["cf_row"])
+                                try:
+                                    new_pred = pipeline.predict(new_row.to_frame().T)[0]
+                                except Exception as e:
+                                    st.error(f"Re-prediction failed: {e}")
+                                    new_pred = None
+                                if new_pred == 1:
+                                    st.success("After applying changes: model predicts APPROVE ✅")
+                                elif new_pred == 0:
+                                    st.error("After applying changes: model still predicts DENY ❌")
+                                else:
+                                    st.write("Prediction result:", new_pred)
+            except Exception as e:
+                st.error(f"Counterfactual generation failed: {e}")
+
+if st.sidebar.button("Predict & Suggest CFs"):
+    pass  # Button click triggers re-run, but logic is outside
