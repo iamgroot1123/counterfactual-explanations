@@ -1,4 +1,3 @@
-# src/visualize.py
 """
 Create human-readable counterfactual actions from filtered CFs and write top-N slide-ready CSV.
 

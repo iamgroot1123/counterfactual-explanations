@@ -1,4 +1,3 @@
-# src/evaluate_cf.py
 """
 Evaluate and filter counterfactuals: normalized L2, weighted cost, KNN plausibility, and fairness stub.
 

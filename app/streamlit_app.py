@@ -1,4 +1,3 @@
-# app/streamlit_app.py
 """
 Streamlit demo for interactive counterfactual explanations.
 
@@ -281,10 +280,26 @@ else:
         # Generate CFs with DiCE for this single instance
         with st.spinner("Generating counterfactual explanations (DiCE)..."):
             try:
-                continuous = feature_columns.copy()
+                # Get continuous and categorical features from config
+                continuous_features_names = cfg.get("continuous_features", [])
+                categorical_features_names = cfg.get("categorical_features", [])
+
+                # Expand to one-hot encoded column names
+                continuous_features = expand_to_encoded(continuous_features_names, feature_columns)
+                categorical_features = expand_to_encoded(categorical_features_names, feature_columns)
+
+                # Ensure no overlap and all columns are covered
+                continuous_features = [f for f in continuous_features if f not in categorical_features]
+                all_d_features = continuous_features + categorical_features
+                missing_features = [f for f in feature_columns if f not in all_d_features]
+                if missing_features:
+                    # Add missing features to continuous as a fallback
+                    continuous_features.extend(missing_features)
+
                 d = dice_ml.Data(
                     dataframe=train_df[[*feature_columns, target_col]],
-                    continuous_features=continuous,
+                    continuous_features=continuous_features,
+                    categorical_features=categorical_features,
                     outcome_name=target_col,
                 )
                 m = dice_ml.Model(model=pipeline, backend="sklearn", model_type="classifier")
@@ -300,18 +315,11 @@ else:
                 for col in immut_expanded:
                     if col in template.columns:
                         val = template.at[0, col]
-
-                        # binary / integer one-hot case
-                        if str(val) in ("0", "1") or isinstance(val, (int, np.integer)):
+                        # Use permitted_list for categorical features, permitted_range for continuous
+                        if col in categorical_features:
                             permitted_list[col] = [int(val)]
                         else:
-                            # try to interpret as float; otherwise keep as string
-                            try:
-                                fv = float(val)
-                            except Exception:
-                                permitted_list[col] = [str(val)]
-                            else:
-                                permitted_range[col] = [fv, fv]
+                            permitted_range[col] = [float(val), float(val)]
 
                 # add feature_ranges from cfg
                 if "feature_ranges" in cfg and isinstance(cfg["feature_ranges"], dict):
@@ -407,7 +415,7 @@ else:
                     # filter and sort
                     filtered = [r for r in st.session_state['readable'] if r["cost"] <= realism]
                     if not filtered:
-                        st.info("No CFs meet the realism threshold. Lower the threshold or try different inputs.")
+                        st.info("No CFs meet the realism threshold.")
                     else:
                         # sort by n_changed then cost
                         filtered = sorted(filtered, key=lambda x: (x["n_changed"], x["cost"]))

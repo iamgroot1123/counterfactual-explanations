@@ -1,5 +1,4 @@
 immutable_features:
-  - age
   - sex
 
 sensitive_features:
@@ -14,7 +13,19 @@ actionable_features:
   - job
   - purpose
 
+continuous_features:
+  - age
+  - job
+  - credit_amount
+  - duration
+
+categorical_features:
+  - sex
+  - housing
+  - saving_accounts
+  - checking_account
+  - purpose
+
 feature_ranges:
   credit_amount: [250, 20000]
   duration: [4, 72]
-  
