@@ -146,8 +146,8 @@ def set_col_val_float(template, col, val):
     return template
 
 # ---- UI: Title and short explanation ----
-st.set_page_config(page_title="Counterfactuals Demo — Truth Decoders", layout="wide")
-st.title("Counterfactuals Demo — Truth Decoders")
+st.set_page_config(page_title="Counterfactuals Explanations — Truth Decoders", layout="wide")
+st.title("Counterfactuals Explanations — Truth Decoders")
 st.markdown(
     "Counterfactual explanations show minimal changes that would flip a model's decision.\n"
     "Enter applicant details below. If the model denies the application, the app will suggest actionable changes."
